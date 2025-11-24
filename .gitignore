@@ -39,3 +39,10 @@
 
 # debug information files
 *.dwo
+/fix-mesh-normals/.claude
+/fix-mesh-normals/.idea
+/fix-mesh-normals/.vs
+/fix-mesh-normals/FixMeshNormals/.idea
+/fix-mesh-normals/FixMeshNormals/x64
+/fix-mesh-normals/x64
+/fix-mesh-normals/resources
