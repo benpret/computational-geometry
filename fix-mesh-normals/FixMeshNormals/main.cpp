@@ -38,9 +38,15 @@ int main(int argc, char** argv) {
 				outputPath = std::filesystem::absolute(outputPath);
 			}
 
-			std::size_t created = FixMeshNormals::ProcessStageFile(inputPath, outputPath, opts.overwrite);
+			std::size_t created = FixMeshNormals::ProcessStageFile(
+				inputPath,
+				outputPath,
+				opts.overwrite,
+				opts.processElements,
+				opts.writeVoxelised,
+				opts.weldTolerance);
 			if (created == 0) {
-				std::cout << "  No voxelised meshes created for " << inputPath << "\n";
+				std::cout << "  No meshes created for " << inputPath << "\n";
 			}
 		}
 

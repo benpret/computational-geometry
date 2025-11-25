@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <set>
 #include <stack>
 
@@ -251,6 +252,46 @@ pxr::GfVec3d ComponentCentroid(const std::vector<pxr::GfVec3f>& points,
 		centroid += pxr::GfVec3d(points[v]);
 	}
 	return centroid / static_cast<double>(usedVertices.size());
+}
+
+ManifoldDiagnostic CheckManifold(const std::vector<Face>& faces) {
+	EdgeMap edgeMap = BuildEdgeMap(faces);
+
+	ManifoldDiagnostic diag{};
+	diag.totalEdges = static_cast<int>(edgeMap.size());
+
+	for (const auto& [edge, faceRefs] : edgeMap) {
+		int faceCount = static_cast<int>(faceRefs.size());
+		if (faceCount == 1) {
+			++diag.boundaryEdges;
+			diag.boundaryEdgeList.push_back(edge);
+		} else if (faceCount == 2) {
+			++diag.manifoldEdges;
+		} else {
+			++diag.nonManifoldEdges;
+			diag.nonManifoldEdgeList.push_back(edge);
+		}
+	}
+
+	diag.isWatertight = (diag.boundaryEdges == 0);
+	diag.isManifold = (diag.nonManifoldEdges == 0);
+
+	return diag;
+}
+
+void PrintManifoldDiagnostic(const ManifoldDiagnostic& diag, const std::string& meshName) {
+	std::cout << "    Manifold check for " << meshName << ":\n";
+	std::cout << "      Total edges: " << diag.totalEdges << "\n";
+	std::cout << "      Manifold edges (2 faces): " << diag.manifoldEdges << "\n";
+	std::cout << "      Boundary edges (1 face): " << diag.boundaryEdges << "\n";
+	std::cout << "      Non-manifold edges (3+ faces): " << diag.nonManifoldEdges << "\n";
+	std::cout << "      Watertight: " << (diag.isWatertight ? "YES" : "NO") << "\n";
+	std::cout << "      Manifold: " << (diag.isManifold ? "YES" : "NO") << "\n";
+
+	if (!diag.isWatertight) {
+		std::cout << "      WARNING: Mesh has " << diag.boundaryEdges
+				  << " boundary edge(s) - voxelization may fail!\n";
+	}
 }
 
 } // namespace FixMeshNormals

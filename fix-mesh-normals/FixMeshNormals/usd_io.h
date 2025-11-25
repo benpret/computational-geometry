@@ -16,6 +16,11 @@ bool ReadMeshFromUsd(const pxr::UsdGeomMesh& mesh, MeshData& outData);
 bool WriteMeshToUsd(pxr::UsdStageRefPtr stage, const pxr::SdfPath& originalPath, const ProcessedMesh& mesh, bool overwrite);
 
 // Processes all meshes in a USD stage file
-std::size_t ProcessStageFile(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, bool overwrite);
+std::size_t ProcessStageFile(const std::filesystem::path& inputPath,
+							 const std::filesystem::path& outputPath,
+							 bool overwrite,
+							 bool processElements,
+							 bool writeVoxelised,
+							 double weldTolerance);
 
 } // namespace FixMeshNormals

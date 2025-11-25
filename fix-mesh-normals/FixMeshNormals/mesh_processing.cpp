@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 
 namespace FixMeshNormals {
 
@@ -21,7 +22,7 @@ double ComputeVoxelSize(const pxr::GfRange3d& bounds) {
 
 	const pxr::GfVec3d size = bounds.GetSize();
 	const double maxDim = std::max({size[0], size[1], size[2]});
-	const double defaultDivisions = 1024.0;
+	const double defaultDivisions = 1024;
 	double voxelSize = maxDim > 0.0 ? maxDim / defaultDivisions : 0.01;
 
 	const double minVoxelSize = 1e-4;
@@ -40,9 +41,11 @@ openvdb::FloatGrid::Ptr MeshToGrid(const MeshData& mesh) {
 	const double voxelSize = ComputeVoxelSize(mesh.bounds);
 	openvdb::math::Transform::Ptr transform = openvdb::math::Transform::createLinearTransform(voxelSize);
 
-	// Use small interior band and a few voxels exterior to capture the surface.
+	// Band widths in world units
 	const double exteriorBandWidth = 3.0 * voxelSize;
-	const double interiorBandWidth = 1.0 * voxelSize;
+	// Use max double for interior band - tells OpenVDB to fill entire interior
+	const double interiorBandWidth = std::numeric_limits<double>::max();
+
 	return openvdb::tools::meshToSignedDistanceField<openvdb::FloatGrid>(
 		*transform, mesh.points, mesh.triangles, mesh.quads, exteriorBandWidth, interiorBandWidth);
 }
@@ -266,7 +269,7 @@ std::tuple<pxr::VtArray<int>, pxr::VtArray<int>, int> FixOrientationWithVDBOracl
 	auto& transform = sdfGrid->transform();
 
 	int flippedCount = 0;
-	const double epsilon = 1;  // Small offset along normal for sampling
+	const double epsilon = 2;  // Small offset along normal for sampling
 
 	for (std::size_t faceIdx = 0; faceIdx < faces.size(); ++faceIdx) {
 		const Face& face = faces[faceIdx];

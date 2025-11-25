@@ -53,4 +53,22 @@ pxr::GfVec3d ComponentCentroid(const std::vector<pxr::GfVec3f>& points,
 							   const std::vector<Face>& faces,
 							   const std::vector<int>& faceIndices);
 
+// Mesh manifold diagnostic info
+struct ManifoldDiagnostic {
+	int totalEdges;
+	int boundaryEdges;      // edges with only 1 face (open mesh)
+	int nonManifoldEdges;   // edges with 3+ faces (non-manifold)
+	int manifoldEdges;      // edges with exactly 2 faces (good)
+	bool isWatertight;      // true if no boundary edges
+	bool isManifold;        // true if no non-manifold edges
+	std::vector<EdgeKey> boundaryEdgeList;
+	std::vector<EdgeKey> nonManifoldEdgeList;
+};
+
+// Check if mesh is manifold/watertight
+ManifoldDiagnostic CheckManifold(const std::vector<Face>& faces);
+
+// Print diagnostic info to stdout
+void PrintManifoldDiagnostic(const ManifoldDiagnostic& diag, const std::string& meshName);
+
 } // namespace FixMeshNormals

@@ -1,4 +1,5 @@
 #include "usd_io.h"
+#include "topology.h"
 
 #include <pxr/base/gf/vec3d.h>
 #include <pxr/base/tf/token.h>
@@ -6,7 +7,12 @@
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usdGeom/tokens.h>
 
+#include <cmath>
 #include <iostream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace FixMeshNormals {
 
@@ -37,6 +43,249 @@ bool ShouldSkipPrim(const pxr::UsdPrim& prim) {
 	}
 
 	return false;
+}
+
+std::vector<std::size_t> ComputeFaceOffsets(const pxr::VtArray<int>& counts) {
+	std::vector<std::size_t> offsets;
+	offsets.reserve(counts.size());
+	std::size_t cursor = 0;
+	for (int c : counts) {
+		offsets.push_back(cursor);
+		cursor += static_cast<std::size_t>(c);
+	}
+	return offsets;
+}
+
+std::vector<Face> BuildFaces(const pxr::VtArray<int>& counts, const pxr::VtArray<int>& indices) {
+	std::vector<Face> faces;
+	faces.reserve(counts.size());
+	std::size_t cursor = 0;
+	for (int c : counts) {
+		Face f;
+		for (int i = 0; i < c && cursor + i < indices.size(); ++i) {
+			f.push_back(indices[cursor + i]);
+		}
+		faces.push_back(std::move(f));
+		cursor += static_cast<std::size_t>(c);
+	}
+	return faces;
+}
+
+std::vector<std::vector<int>> CollectComponents(const pxr::VtArray<int>& counts,
+												const pxr::VtArray<int>& indices,
+												bool processElements) {
+	std::vector<std::vector<int>> components;
+	if (!processElements) {
+		std::vector<int> single;
+		single.reserve(counts.size());
+		for (std::size_t i = 0; i < counts.size(); ++i) {
+			single.push_back(static_cast<int>(i));
+		}
+		components.push_back(std::move(single));
+		return components;
+	}
+
+	std::vector<Face> faces = BuildFaces(counts, indices);
+	WindingResult wr = UnifyWinding(faces);
+	return wr.components;
+}
+
+struct ComponentData {
+	pxr::VtArray<pxr::GfVec3f> points;
+	pxr::VtArray<int> counts;
+	pxr::VtArray<int> indices;
+};
+
+ComponentData ExtractComponent(const pxr::VtArray<pxr::GfVec3f>& allPoints,
+							   const pxr::VtArray<int>& counts,
+							   const pxr::VtArray<int>& indices,
+							   const std::vector<int>& faceIndices,
+							   const std::vector<std::size_t>& faceOffsets) {
+	ComponentData comp;
+	comp.counts.reserve(faceIndices.size());
+
+	std::vector<int> remap(allPoints.size(), -1);
+
+	for (int faceIdx : faceIndices) {
+		if (faceIdx < 0 || static_cast<std::size_t>(faceIdx) >= counts.size()) {
+			continue;
+		}
+		int vertsInFace = counts[faceIdx];
+		const std::size_t offset = faceOffsets[faceIdx];
+		if (offset + static_cast<std::size_t>(vertsInFace) > indices.size()) {
+			continue;
+		}
+
+		comp.counts.push_back(vertsInFace);
+		for (int i = 0; i < vertsInFace; ++i) {
+			const int origIndex = indices[offset + i];
+			if (origIndex < 0 || static_cast<std::size_t>(origIndex) >= allPoints.size()) {
+				continue;
+			}
+			int mapped = remap[origIndex];
+			if (mapped == -1) {
+				mapped = static_cast<int>(comp.points.size());
+				comp.points.push_back(allPoints[origIndex]);
+				remap[origIndex] = mapped;
+			}
+			comp.indices.push_back(mapped);
+		}
+	}
+
+	return comp;
+}
+
+pxr::GfVec3f ComputePivot(const pxr::VtArray<pxr::GfVec3f>& points) {
+	pxr::GfRange3d bounds;
+	for (const auto& p : points) {
+		bounds.UnionWith(pxr::GfVec3d(p));
+	}
+	if (bounds.IsEmpty()) {
+		return pxr::GfVec3f(0.0f);
+	}
+	pxr::GfVec3d center = (bounds.GetMin() + bounds.GetMax()) * 0.5;
+	return pxr::GfVec3f(center);
+}
+
+void TranslatePoints(pxr::VtArray<pxr::GfVec3f>& points, const pxr::GfVec3f& delta) {
+	for (auto& p : points) {
+		p += delta;
+	}
+}
+
+struct WeldResult {
+	pxr::VtArray<pxr::GfVec3f> points;
+	pxr::VtArray<int> counts;
+	pxr::VtArray<int> indices;
+};
+
+struct QuantizedKey {
+	long long x;
+	long long y;
+	long long z;
+	bool operator==(const QuantizedKey& other) const {
+		return x == other.x && y == other.y && z == other.z;
+	}
+};
+
+struct QuantizedKeyHash {
+	std::size_t operator()(const QuantizedKey& k) const noexcept {
+		std::size_t hx = std::hash<long long>{}(k.x);
+		std::size_t hy = std::hash<long long>{}(k.y);
+		std::size_t hz = std::hash<long long>{}(k.z);
+		return hx ^ (hy << 1) ^ (hz << 2);
+	}
+};
+
+WeldResult WeldMesh(const pxr::VtArray<pxr::GfVec3f>& points,
+					const pxr::VtArray<int>& counts,
+					const pxr::VtArray<int>& indices,
+					double tolerance) {
+	WeldResult res;
+	if (points.empty() || counts.empty() || indices.empty()) {
+		return res;
+	}
+
+	std::unordered_map<QuantizedKey, std::vector<int>, QuantizedKeyHash> bins;
+	std::vector<int> mapIdx(points.size(), -1);
+
+	for (std::size_t i = 0; i < points.size(); ++i) {
+		const pxr::GfVec3f& p = points[i];
+		QuantizedKey key{
+			static_cast<long long>(std::llround(p[0] / tolerance)),
+			static_cast<long long>(std::llround(p[1] / tolerance)),
+			static_cast<long long>(std::llround(p[2] / tolerance))
+		};
+
+		int targetIdx = -1;
+		auto it = bins.find(key);
+		if (it != bins.end()) {
+			for (int candidate : it->second) {
+				pxr::GfVec3f diff = p - res.points[candidate];
+				if (diff.GetLength() <= tolerance) {
+					targetIdx = candidate;
+					break;
+				}
+			}
+		}
+
+		if (targetIdx == -1) {
+			targetIdx = static_cast<int>(res.points.size());
+			res.points.push_back(p);
+			bins[key].push_back(targetIdx);
+		}
+
+		mapIdx[i] = targetIdx;
+	}
+
+	std::size_t cursor = 0;
+	for (int c : counts) {
+		if (cursor + static_cast<std::size_t>(c) > indices.size()) {
+			break;
+		}
+		pxr::VtArray<int> mappedFace;
+		mappedFace.reserve(static_cast<std::size_t>(c));
+		std::unordered_set<int> uniqueVerts;
+		for (int i = 0; i < c; ++i) {
+			int originalIdx = indices[cursor + i];
+			if (originalIdx < 0 || static_cast<std::size_t>(originalIdx) >= mapIdx.size()) {
+				mappedFace.clear();
+				break;
+			}
+			int mapped = mapIdx[originalIdx];
+			mappedFace.push_back(mapped);
+			uniqueVerts.insert(mapped);
+		}
+
+		if (!mappedFace.empty() && static_cast<int>(uniqueVerts.size()) >= 3) {
+			res.counts.push_back(c);
+			for (int v : mappedFace) {
+				res.indices.push_back(v);
+			}
+		}
+		cursor += static_cast<std::size_t>(c);
+	}
+
+	return res;
+}
+
+MeshData BuildMeshData(const pxr::VtArray<pxr::GfVec3f>& points,
+					   const pxr::VtArray<int>& counts,
+					   const pxr::VtArray<int>& indices) {
+	MeshData meshData;
+	meshData.points.reserve(points.size());
+	for (const auto& p : points) {
+		meshData.points.emplace_back(p[0], p[1], p[2]);
+		meshData.bounds.UnionWith(pxr::GfVec3d(p));
+	}
+
+	std::size_t offset = 0;
+	for (std::size_t face = 0; face < counts.size(); ++face) {
+		int vertsInFace = counts[face];
+		if (vertsInFace < 3) {
+			offset += vertsInFace;
+			continue;
+		}
+
+		if (offset + static_cast<std::size_t>(vertsInFace) > indices.size()) {
+			break;
+		}
+
+		const int v0 = indices[offset];
+		if (vertsInFace == 3) {
+			meshData.triangles.emplace_back(v0, indices[offset + 1], indices[offset + 2]);
+		} else if (vertsInFace == 4) {
+			meshData.quads.emplace_back(v0, indices[offset + 1], indices[offset + 2], indices[offset + 3]);
+		} else {
+			for (int i = 1; i + 1 < vertsInFace; ++i) {
+				meshData.triangles.emplace_back(v0, indices[offset + i], indices[offset + i + 1]);
+			}
+		}
+
+		offset += vertsInFace;
+	}
+
+	return meshData;
 }
 
 } // anonymous namespace
@@ -132,7 +381,12 @@ bool WriteMeshToUsd(pxr::UsdStageRefPtr stage, const pxr::SdfPath& originalPath,
 	return true;
 }
 
-std::size_t ProcessStageFile(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, bool overwrite) {
+std::size_t ProcessStageFile(const std::filesystem::path& inputPath,
+							 const std::filesystem::path& outputPath,
+							 bool overwrite,
+							 bool processElements,
+							 bool writeVoxelised,
+							 double weldTolerance) {
 	// Use generic_string to keep forward slashes, which USD handles more reliably on Windows.
 	std::string inputPathAsString = inputPath.generic_string();
 	std::cout << "Opening USD: " << inputPathAsString << "\n";
@@ -143,7 +397,9 @@ std::size_t ProcessStageFile(const std::filesystem::path& inputPath, const std::
 		return 0;
 	}
 
-	std::size_t createdMeshes = 0;
+	std::size_t createdFixed = 0;
+	std::size_t createdVoxelised = 0;
+	std::size_t totalComponentsProcessed = 0;
 	std::cout << "Processing stage...\n";
 
 	for (const auto& prim : stage->Traverse()) {
@@ -183,67 +439,126 @@ std::size_t ProcessStageFile(const std::filesystem::path& inputPath, const std::
 			continue;
 		}
 
-		// Step 1: Fix winding consistency
-		auto [windingFixedCounts, windingFixedIndices] = FixWindingAndOrientation(points, counts, indices);
+		const std::vector<std::size_t> faceOffsets = ComputeFaceOffsets(counts);
+		std::vector<std::vector<int>> components = CollectComponents(counts, indices, processElements);
+		std::cout << "    Processing " << components.size() << " component(s)\n";
+		std::size_t processedComponents = 0;
 
-		// Step 2: Convert to MeshData for SDF creation
-		MeshData meshData;
-		meshData.points.reserve(points.size());
-		for (const auto& p : points) {
-			meshData.points.emplace_back(p[0], p[1], p[2]);
-			meshData.bounds.UnionWith(pxr::GfVec3d(p));
-		}
+		pxr::VtArray<pxr::GfVec3f> fixedPointsCombined;
+		pxr::VtArray<int> fixedCountsCombined;
+		pxr::VtArray<int> fixedIndicesCombined;
 
-		// Convert topology to triangles/quads for VDB
-		std::size_t offset = 0;
-		for (std::size_t face = 0; face < windingFixedCounts.size(); ++face) {
-			int vertsInFace = windingFixedCounts[face];
-			if (vertsInFace < 3) {
-				offset += vertsInFace;
+		ProcessedMesh voxelCombined;
+		int totalOracleFlips = 0;
+
+		for (const auto& compFaces : components) {
+			ComponentData comp = ExtractComponent(points, counts, indices, compFaces, faceOffsets);
+			if (comp.points.empty() || comp.counts.empty() || comp.indices.empty()) {
+				continue;
+			}
+			const std::size_t compIndex = processedComponents + 1;
+			std::cout << "    Mesh " << prim.GetPath().GetString()
+					  << " component " << compIndex << "/" << components.size()
+					  << " (" << comp.counts.size() << " faces, " << comp.points.size() << " verts)\n";
+
+			pxr::GfVec3f pivot = ComputePivot(comp.points);
+			TranslatePoints(comp.points, -pivot);
+
+			WeldResult welded = WeldMesh(comp.points, comp.counts, comp.indices, weldTolerance);
+			if (welded.points.empty() || welded.counts.empty() || welded.indices.empty()) {
 				continue;
 			}
 
-			if (offset + static_cast<std::size_t>(vertsInFace) > windingFixedIndices.size()) {
-				std::cerr << "  Mesh " << mesh.GetPath().GetString() << " has inconsistent topology; skipping.\n";
+			auto [windingCounts, windingIndices] = FixWindingAndOrientation(welded.points, welded.counts, welded.indices);
+
+			MeshData sdfMesh = BuildMeshData(welded.points, windingCounts, windingIndices);
+			if (sdfMesh.IsEmpty()) {
 				continue;
 			}
 
-			const int v0 = windingFixedIndices[offset];
-			if (vertsInFace == 3) {
-				meshData.triangles.emplace_back(v0, windingFixedIndices[offset + 1], windingFixedIndices[offset + 2]);
-			} else if (vertsInFace == 4) {
-				meshData.quads.emplace_back(v0, windingFixedIndices[offset + 1], windingFixedIndices[offset + 2], windingFixedIndices[offset + 3]);
-			} else {
-				// Fan triangulation for n-gons
-				for (int i = 1; i + 1 < vertsInFace; ++i) {
-					meshData.triangles.emplace_back(v0, windingFixedIndices[offset + i], windingFixedIndices[offset + i + 1]);
+			openvdb::FloatGrid::Ptr sdfGrid = CreateSDFFromMesh(sdfMesh);
+			if (!sdfGrid) {
+				continue;
+			}
+
+			auto [oracleCounts, oracleIndices, oracleFlips] = FixOrientationWithVDBOracle(
+				welded.points, windingCounts, windingIndices, sdfGrid);
+			totalOracleFlips += oracleFlips;
+
+			// Build fixed geometry (restore pivot)
+			pxr::VtArray<pxr::GfVec3f> fixedPoints = welded.points;
+			TranslatePoints(fixedPoints, pivot);
+
+			std::size_t baseFixed = fixedPointsCombined.size();
+			fixedPointsCombined.reserve(fixedPointsCombined.size() + fixedPoints.size());
+			for (const auto& p : fixedPoints) {
+				fixedPointsCombined.push_back(p);
+			}
+			fixedCountsCombined.reserve(fixedCountsCombined.size() + oracleCounts.size());
+			for (int c : oracleCounts) {
+				fixedCountsCombined.push_back(c);
+			}
+			for (int idx : oracleIndices) {
+				fixedIndicesCombined.push_back(static_cast<int>(baseFixed) + idx);
+			}
+
+			// Voxelisation (always computed; optional write)
+			MeshData voxelMeshInput = BuildMeshData(welded.points, oracleCounts, oracleIndices);
+			ProcessedMesh voxelComp = VoxelizeMesh(voxelMeshInput);
+			if (!voxelComp.points.empty()) {
+				TranslatePoints(voxelComp.points, pivot);
+				// Recompute extent after translation
+				voxelComp.extent = ComputeExtentFromPoints(voxelComp.points);
+
+				std::size_t baseVoxel = voxelCombined.points.size();
+				voxelCombined.points.reserve(voxelCombined.points.size() + voxelComp.points.size());
+				for (const auto& p : voxelComp.points) {
+					voxelCombined.points.push_back(p);
+				}
+				voxelCombined.faceVertexCounts.reserve(voxelCombined.faceVertexCounts.size() + voxelComp.faceVertexCounts.size());
+				for (int c : voxelComp.faceVertexCounts) {
+					voxelCombined.faceVertexCounts.push_back(c);
+				}
+				for (int idx : voxelComp.faceVertexIndices) {
+					voxelCombined.faceVertexIndices.push_back(static_cast<int>(baseVoxel) + idx);
 				}
 			}
-
-			offset += vertsInFace;
+			++processedComponents;
 		}
 
-		if (meshData.IsEmpty()) {
-			std::cerr << "  Mesh " << mesh.GetPath().GetString() << " has no valid geometry; skipping.\n";
+		if (fixedPointsCombined.empty() || fixedCountsCombined.empty() || fixedIndicesCombined.empty()) {
+			std::cerr << "  Mesh " << mesh.GetPath().GetString() << " has no valid processed geometry; skipping.\n";
 			continue;
 		}
+		std::cout << "    Processed " << processedComponents << " component(s)\n";
+		totalComponentsProcessed += processedComponents;
 
-		// Step 3: Create SDF from winding-fixed mesh (as oracle)
-		openvdb::FloatGrid::Ptr sdfGrid = CreateSDFFromMesh(meshData);
-		if (!sdfGrid) {
-			std::cerr << "    Failed to create SDF for " << prim.GetPath().GetString() << "\n";
-			continue;
+		// Compute face-varying normals for fixed mesh
+		pxr::VtArray<pxr::GfVec3f> faceVaryingNormals;
+		std::size_t offset = 0;
+		for (int faceCount : fixedCountsCombined) {
+			if (offset + static_cast<std::size_t>(faceCount) > fixedIndicesCombined.size()) {
+				break;
+			}
+			pxr::GfVec3f faceNormal(0.0f);
+			if (faceCount >= 3 && offset + 2 < fixedIndicesCombined.size()) {
+				const pxr::GfVec3f& p0 = fixedPointsCombined[fixedIndicesCombined[offset]];
+				const pxr::GfVec3f& p1 = fixedPointsCombined[fixedIndicesCombined[offset + 1]];
+				const pxr::GfVec3f& p2 = fixedPointsCombined[fixedIndicesCombined[offset + 2]];
+				pxr::GfVec3f n = pxr::GfCross(p1 - p0, p2 - p0);
+				float len = n.GetLength();
+				if (len > 1e-6f) {
+					faceNormal = n / len;
+				}
+			}
+			for (int i = 0; i < faceCount; ++i) {
+				faceVaryingNormals.push_back(faceNormal);
+			}
+			offset += faceCount;
 		}
 
-		// Step 4: Use SDF oracle to fix original mesh face orientations
-		auto [oracleCounts, oracleIndices, oracleFlips] = FixOrientationWithVDBOracle(
-			points, windingFixedCounts, windingFixedIndices, sdfGrid);
-
-		// Step 5: Create "_fixed" mesh with corrected topology
 		const std::string fixedName = prim.GetPath().GetName() + "_fixed";
 		const pxr::SdfPath fixedPath = prim.GetPath().GetParentPath().AppendChild(pxr::TfToken(fixedName));
-
-		// Check if _fixed mesh already exists
 		pxr::UsdPrim existingFixed = stage->GetPrimAtPath(fixedPath);
 		if (existingFixed) {
 			if (!overwrite) {
@@ -255,64 +570,37 @@ std::size_t ProcessStageFile(const std::filesystem::path& inputPath, const std::
 		}
 
 		if (!existingFixed || overwrite) {
-			// Create new _fixed mesh
 			pxr::UsdGeomMesh fixedMesh = pxr::UsdGeomMesh::Define(stage, fixedPath);
 			fixedMesh.CreateSubdivisionSchemeAttr().Set(pxr::UsdGeomTokens->none);
-			fixedMesh.CreatePointsAttr().Set(points);
-			fixedMesh.CreateFaceVertexCountsAttr().Set(oracleCounts);
-			fixedMesh.CreateFaceVertexIndicesAttr().Set(oracleIndices);
-
-			// Compute and set face-varying normals for the corrected mesh
-			pxr::VtArray<pxr::GfVec3f> faceVaryingNormals;
-			offset = 0;
-			for (int faceCount : oracleCounts) {
-				pxr::GfVec3f faceNormal(0.0f);
-				if (faceCount >= 3 && offset + 2 < oracleIndices.size()) {
-					const pxr::GfVec3f& p0 = points[oracleIndices[offset]];
-					const pxr::GfVec3f& p1 = points[oracleIndices[offset + 1]];
-					const pxr::GfVec3f& p2 = points[oracleIndices[offset + 2]];
-					pxr::GfVec3f n = pxr::GfCross(p1 - p0, p2 - p0);
-					float len = n.GetLength();
-					if (len > 1e-6f) {
-						faceNormal = n / len;
-					}
-				}
-				// Repeat normal for each vertex in the face (face-varying)
-				for (int i = 0; i < faceCount; ++i) {
-					faceVaryingNormals.push_back(faceNormal);
-				}
-				offset += faceCount;
-			}
-
+			fixedMesh.CreatePointsAttr().Set(fixedPointsCombined);
+			fixedMesh.CreateFaceVertexCountsAttr().Set(fixedCountsCombined);
+			fixedMesh.CreateFaceVertexIndicesAttr().Set(fixedIndicesCombined);
 			fixedMesh.GetNormalsAttr().Set(faceVaryingNormals);
 			fixedMesh.SetNormalsInterpolation(pxr::TfToken("faceVarying"));
 
-			// Compute extent
-			pxr::GfRange3d bounds;
-			for (const auto& p : points) {
-				bounds.UnionWith(pxr::GfVec3d(p));
-			}
-			if (!bounds.IsEmpty()) {
-				pxr::VtArray<pxr::GfVec3f> extent;
-				extent.resize(2);
-				extent[0] = pxr::GfVec3f(bounds.GetMin());
-				extent[1] = pxr::GfVec3f(bounds.GetMax());
+			pxr::VtArray<pxr::GfVec3f> extent = ComputeExtentFromPoints(fixedPointsCombined);
+			if (!extent.empty()) {
 				fixedMesh.CreateExtentAttr().Set(extent);
 			}
 
 			std::cout << "    Created fixed mesh: " << fixedPath.GetString()
-					  << " (" << oracleFlips << " faces flipped by oracle, " << points.size() << " verts)\n";
-			++createdMeshes;
+					  << " (" << totalOracleFlips << " faces flipped by oracle, "
+					  << fixedPointsCombined.size() << " verts)\n";
+			++createdFixed;
 		}
 
-		// Step 6: Optionally create voxelized mesh as well
-		ProcessedMesh voxelized = VoxelizeMesh(meshData);
-		if (!voxelized.points.empty()) {
-			WriteMeshToUsd(stage, prim.GetPath(), voxelized, overwrite);
+		if (writeVoxelised && !voxelCombined.points.empty()) {
+			voxelCombined.extent = ComputeExtentFromPoints(voxelCombined.points);
+			voxelCombined.normals = ComputeFaceNormals(voxelCombined.points, voxelCombined.faceVertexCounts, voxelCombined.faceVertexIndices);
+			if (WriteMeshToUsd(stage, prim.GetPath(), voxelCombined, overwrite)) {
+				++createdVoxelised;
+			}
 		}
 	}
 
-	std::cout << "Processing complete. Created " << createdMeshes << " voxelised mesh(es).\n";
+	std::cout << "Processing complete. Created " << createdFixed << " fixed mesh(es)"
+			  << " and " << createdVoxelised << " voxelised mesh(es). "
+			  << "Processed " << totalComponentsProcessed << " component(s) total.\n";
 
 	const std::string outputPathAsString = outputPath.generic_string();
 	if (!stage->Export(outputPathAsString)) {
@@ -321,7 +609,7 @@ std::size_t ProcessStageFile(const std::filesystem::path& inputPath, const std::
 	}
 
 	std::cout << "Wrote voxelised stage to: " << outputPathAsString << "\n";
-	return createdMeshes;
+	return createdFixed;
 }
 
 } // namespace FixMeshNormals
