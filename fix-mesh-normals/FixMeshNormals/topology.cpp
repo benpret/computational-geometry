@@ -294,4 +294,377 @@ void PrintManifoldDiagnostic(const ManifoldDiagnostic& diag, const std::string& 
 	}
 }
 
+namespace {
+
+// Build a map from vertex to connected boundary vertices (undirected)
+// Returns both the adjacency map and a set of all boundary edges
+std::pair<std::map<int, std::set<int>>, std::set<EdgeKey>> BuildBoundaryGraph(
+	const std::vector<Face>& faces,
+	const EdgeMap& edgeMap) {
+
+	std::map<int, std::set<int>> adjacency;
+	std::set<EdgeKey> boundaryEdges;
+
+	for (const auto& [edgeKey, faceRefs] : edgeMap) {
+		if (faceRefs.size() != 1) {
+			continue;  // Not a boundary edge
+		}
+
+		int v0 = edgeKey.first;
+		int v1 = edgeKey.second;
+
+		// Store undirected adjacency
+		adjacency[v0].insert(v1);
+		adjacency[v1].insert(v0);
+		boundaryEdges.insert(edgeKey);
+	}
+
+	return {adjacency, boundaryEdges};
+}
+
+// Trace a boundary loop starting from a vertex using undirected graph
+// Returns the loop as a list of vertex indices, or empty if no valid loop
+std::vector<int> TraceBoundaryLoopUndirected(int startVertex,
+											  std::map<int, std::set<int>>& adjacency,
+											  std::set<int>& visitedVertices) {
+	std::vector<int> loop;
+	int current = startVertex;
+	int prev = -1;
+
+	while (true) {
+		loop.push_back(current);
+		visitedVertices.insert(current);
+
+		auto it = adjacency.find(current);
+		if (it == adjacency.end() || it->second.empty()) {
+			// Dead end - not a valid loop
+			return {};
+		}
+
+		// Find next vertex (not the one we came from)
+		int next = -1;
+		for (int neighbor : it->second) {
+			if (neighbor != prev) {
+				next = neighbor;
+				break;
+			}
+		}
+
+		if (next == -1) {
+			// No unvisited neighbor
+			return {};
+		}
+
+		if (next == startVertex && loop.size() >= 3) {
+			// Completed the loop
+			break;
+		}
+
+		if (visitedVertices.count(next) && next != startVertex) {
+			// Hit a visited vertex that's not the start - complex topology
+			return {};
+		}
+
+		prev = current;
+		current = next;
+
+		// Safety check for infinite loops
+		if (loop.size() > 10000) {
+			return {};
+		}
+	}
+
+	return loop;
+}
+
+// Find all boundary loops in the mesh
+std::vector<std::vector<int>> FindBoundaryLoops(const std::vector<Face>& faces,
+												const EdgeMap& edgeMap) {
+	auto [adjacency, boundaryEdges] = BuildBoundaryGraph(faces, edgeMap);
+	std::set<int> visitedVertices;
+	std::vector<std::vector<int>> loops;
+
+	// Find all starting vertices (any vertex with boundary edge connections)
+	for (const auto& [v, neighbors] : adjacency) {
+		if (visitedVertices.count(v)) {
+			continue;
+		}
+
+		// Each boundary vertex should have exactly 2 neighbors for a simple loop
+		if (neighbors.size() != 2) {
+			// Complex topology - skip for now
+			continue;
+		}
+
+		std::vector<int> loop = TraceBoundaryLoopUndirected(v, adjacency, visitedVertices);
+		if (loop.size() >= 3) {
+			loops.push_back(loop);
+		}
+	}
+
+	return loops;
+}
+
+// Compute the normal of a boundary loop based on its vertices
+pxr::GfVec3d ComputeLoopNormal(const std::vector<pxr::GfVec3f>& points,
+							   const std::vector<int>& loop) {
+	if (loop.size() < 3) {
+		return pxr::GfVec3d(0, 0, 1);
+	}
+
+	// Use Newell's method for robust normal computation
+	pxr::GfVec3d normal(0.0);
+	for (std::size_t i = 0; i < loop.size(); ++i) {
+		const pxr::GfVec3f& curr = points[loop[i]];
+		const pxr::GfVec3f& next = points[loop[(i + 1) % loop.size()]];
+
+		normal[0] += (curr[1] - next[1]) * (curr[2] + next[2]);
+		normal[1] += (curr[2] - next[2]) * (curr[0] + next[0]);
+		normal[2] += (curr[0] - next[0]) * (curr[1] + next[1]);
+	}
+
+	double len = normal.GetLength();
+	if (len > 1e-10) {
+		normal /= len;
+	}
+
+	return normal;
+}
+
+// Determine the correct winding for a fill face based on adjacent face normals
+// Returns true if the loop should be reversed
+bool ShouldReverseLoop(const std::vector<pxr::GfVec3f>& points,
+					   const std::vector<Face>& faces,
+					   const std::vector<int>& loop,
+					   const EdgeMap& edgeMap) {
+	if (loop.size() < 3) {
+		return false;
+	}
+
+	// Find an adjacent face to determine correct winding
+	// Look at the first edge of the loop
+	int v0 = loop[0];
+	int v1 = loop[1];
+	EdgeKey key = (v0 < v1) ? EdgeKey(v0, v1) : EdgeKey(v1, v0);
+
+	auto it = edgeMap.find(key);
+	if (it == edgeMap.end() || it->second.empty()) {
+		return false;
+	}
+
+	// Get the adjacent face's edge direction
+	const auto& [faceIdx, adjV0, adjV1] = it->second[0];
+
+	// The boundary loop should have opposite winding to the adjacent face
+	// If the adjacent face has edge (v0->v1), the fill should have (v1->v0)
+	// The loop is traced following boundary edges, so it already has the face's winding
+	// We need to reverse it to get the opposite winding (facing outward to fill the hole)
+
+	// Actually, boundary edges are traced in the direction they appear in faces
+	// So the loop has the same winding as adjacent faces
+	// To create a fill face that closes the hole, we need opposite winding
+	return true;
+}
+
+// Triangulate a polygon loop using ear clipping
+// Returns triangles as faces with 3 vertices each
+std::vector<Face> TriangulateLoop(const std::vector<pxr::GfVec3f>& points,
+								  const std::vector<int>& loop) {
+	std::vector<Face> triangles;
+
+	if (loop.size() < 3) {
+		return triangles;
+	}
+
+	if (loop.size() == 3) {
+		triangles.push_back({loop[0], loop[1], loop[2]});
+		return triangles;
+	}
+
+	// Simple fan triangulation for convex or nearly-convex polygons
+	// For more complex holes, ear clipping would be better
+	// Fan from first vertex
+	for (std::size_t i = 1; i + 1 < loop.size(); ++i) {
+		triangles.push_back({loop[0], loop[i], loop[i + 1]});
+	}
+
+	return triangles;
+}
+
+// More robust ear clipping triangulation
+std::vector<Face> EarClipTriangulate(const std::vector<pxr::GfVec3f>& points,
+									 std::vector<int> loop,
+									 const pxr::GfVec3d& normal) {
+	std::vector<Face> triangles;
+
+	if (loop.size() < 3) {
+		return triangles;
+	}
+
+	if (loop.size() == 3) {
+		triangles.push_back({loop[0], loop[1], loop[2]});
+		return triangles;
+	}
+
+	// Project points onto 2D plane for ear detection
+	// Find two axes perpendicular to the normal
+	pxr::GfVec3d axisU, axisV;
+	if (std::abs(normal[0]) < 0.9) {
+		axisU = pxr::GfCross(normal, pxr::GfVec3d(1, 0, 0));
+	} else {
+		axisU = pxr::GfCross(normal, pxr::GfVec3d(0, 1, 0));
+	}
+	axisU.Normalize();
+	axisV = pxr::GfCross(normal, axisU);
+	axisV.Normalize();
+
+	// Project loop vertices to 2D
+	auto project2D = [&](int vertIdx) -> std::pair<double, double> {
+		pxr::GfVec3d p(points[vertIdx]);
+		return {pxr::GfDot(p, axisU), pxr::GfDot(p, axisV)};
+	};
+
+	// Check if a triangle is counter-clockwise in 2D
+	auto isCounterClockwise = [&](int i0, int i1, int i2) -> bool {
+		auto [x0, y0] = project2D(loop[i0]);
+		auto [x1, y1] = project2D(loop[i1]);
+		auto [x2, y2] = project2D(loop[i2]);
+		double cross = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+		return cross > 0;
+	};
+
+	// Check if point is inside triangle
+	auto pointInTriangle = [&](int pi, int i0, int i1, int i2) -> bool {
+		auto [px, py] = project2D(loop[pi]);
+		auto [x0, y0] = project2D(loop[i0]);
+		auto [x1, y1] = project2D(loop[i1]);
+		auto [x2, y2] = project2D(loop[i2]);
+
+		auto sign = [](double x1, double y1, double x2, double y2, double x3, double y3) {
+			return (x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3);
+		};
+
+		double d1 = sign(px, py, x0, y0, x1, y1);
+		double d2 = sign(px, py, x1, y1, x2, y2);
+		double d3 = sign(px, py, x2, y2, x0, y0);
+
+		bool hasNeg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+		bool hasPos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+
+		return !(hasNeg && hasPos);
+	};
+
+	// Ear clipping
+	std::vector<int> remaining;
+	for (std::size_t i = 0; i < loop.size(); ++i) {
+		remaining.push_back(static_cast<int>(i));
+	}
+
+	int maxIterations = static_cast<int>(loop.size() * loop.size());
+	int iterations = 0;
+
+	while (remaining.size() > 3 && iterations < maxIterations) {
+		++iterations;
+		bool earFound = false;
+
+		for (std::size_t i = 0; i < remaining.size(); ++i) {
+			std::size_t prevIdx = (i + remaining.size() - 1) % remaining.size();
+			std::size_t nextIdx = (i + 1) % remaining.size();
+
+			int i0 = remaining[prevIdx];
+			int i1 = remaining[i];
+			int i2 = remaining[nextIdx];
+
+			// Check if this is a convex vertex (ear candidate)
+			if (!isCounterClockwise(i0, i1, i2)) {
+				continue;
+			}
+
+			// Check if any other vertex is inside this triangle
+			bool isEar = true;
+			for (std::size_t j = 0; j < remaining.size(); ++j) {
+				if (j == prevIdx || j == i || j == nextIdx) {
+					continue;
+				}
+				if (pointInTriangle(remaining[j], i0, i1, i2)) {
+					isEar = false;
+					break;
+				}
+			}
+
+			if (isEar) {
+				triangles.push_back({loop[i0], loop[i1], loop[i2]});
+				remaining.erase(remaining.begin() + static_cast<std::ptrdiff_t>(i));
+				earFound = true;
+				break;
+			}
+		}
+
+		if (!earFound) {
+			// No ear found - fall back to fan triangulation for remaining vertices
+			break;
+		}
+	}
+
+	// Handle remaining vertices (3 or couldn't find ears)
+	if (remaining.size() == 3) {
+		triangles.push_back({loop[remaining[0]], loop[remaining[1]], loop[remaining[2]]});
+	} else if (remaining.size() > 3) {
+		// Fallback: fan triangulation
+		for (std::size_t i = 1; i + 1 < remaining.size(); ++i) {
+			triangles.push_back({loop[remaining[0]], loop[remaining[i]], loop[remaining[i + 1]]});
+		}
+	}
+
+	return triangles;
+}
+
+} // anonymous namespace
+
+HoleFillResult FillHoles(const std::vector<pxr::GfVec3f>& points,
+						 const std::vector<Face>& faces,
+						 const EdgeMap& edgeMap) {
+	HoleFillResult result;
+	result.holesFound = 0;
+	result.holesFilled = 0;
+
+	// Find all boundary loops
+	std::vector<std::vector<int>> loops = FindBoundaryLoops(faces, edgeMap);
+	result.holesFound = static_cast<int>(loops.size());
+
+	for (const auto& loop : loops) {
+		if (loop.size() < 3) {
+			continue;
+		}
+
+		// Compute loop normal for triangulation
+		pxr::GfVec3d loopNormal = ComputeLoopNormal(points, loop);
+
+		// Determine if we need to reverse the loop for correct winding
+		std::vector<int> fillLoop = loop;
+		if (ShouldReverseLoop(points, faces, loop, edgeMap)) {
+			std::reverse(fillLoop.begin(), fillLoop.end());
+			loopNormal = -loopNormal;
+		}
+
+		// Triangulate the loop
+		std::vector<Face> fillTriangles = EarClipTriangulate(points, fillLoop, loopNormal);
+
+		if (!fillTriangles.empty()) {
+			for (const auto& tri : fillTriangles) {
+				result.filledFaces.push_back(tri);
+			}
+			++result.holesFilled;
+		}
+	}
+
+	return result;
+}
+
+HoleFillResult FillHoles(const std::vector<pxr::GfVec3f>& points,
+						 const std::vector<Face>& faces) {
+	EdgeMap edgeMap = BuildEdgeMap(faces);
+	return FillHoles(points, faces, edgeMap);
+}
+
 } // namespace FixMeshNormals

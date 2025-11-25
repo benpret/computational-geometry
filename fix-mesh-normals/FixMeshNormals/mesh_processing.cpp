@@ -22,7 +22,7 @@ double ComputeVoxelSize(const pxr::GfRange3d& bounds) {
 
 	const pxr::GfVec3d size = bounds.GetSize();
 	const double maxDim = std::max({size[0], size[1], size[2]});
-	const double defaultDivisions = 1024;
+	const double defaultDivisions = 512;
 	double voxelSize = maxDim > 0.0 ? maxDim / defaultDivisions : 0.01;
 
 	const double minVoxelSize = 1e-4;
@@ -269,7 +269,7 @@ std::tuple<pxr::VtArray<int>, pxr::VtArray<int>, int> FixOrientationWithVDBOracl
 	auto& transform = sdfGrid->transform();
 
 	int flippedCount = 0;
-	const double epsilon = 2;  // Small offset along normal for sampling
+	const double epsilon = 5;  // Small offset along normal for sampling
 
 	for (std::size_t faceIdx = 0; faceIdx < faces.size(); ++faceIdx) {
 		const Face& face = faces[faceIdx];

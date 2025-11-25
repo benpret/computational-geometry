@@ -5,7 +5,7 @@
     <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <LocalDebuggerCommandArguments>../resources/platform_2.usda --out ../resources/platform_fixed.usd</LocalDebuggerCommandArguments>
+    <LocalDebuggerCommandArguments>../resources/building.usd --out ../resources/building_fixed.usd --process-elements   --no-write-voxelised</LocalDebuggerCommandArguments>
     <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
   </PropertyGroup>
 </Project>

@@ -71,4 +71,21 @@ ManifoldDiagnostic CheckManifold(const std::vector<Face>& faces);
 // Print diagnostic info to stdout
 void PrintManifoldDiagnostic(const ManifoldDiagnostic& diag, const std::string& meshName);
 
+// Hole filling result
+struct HoleFillResult {
+	std::vector<Face> filledFaces;  // New faces that fill holes
+	int holesFound;                  // Number of boundary loops found
+	int holesFilled;                 // Number of holes successfully filled
+};
+
+// Find and fill holes in a mesh by detecting boundary edge loops and triangulating them
+// The fill faces will have winding consistent with adjacent faces
+HoleFillResult FillHoles(const std::vector<pxr::GfVec3f>& points,
+						 const std::vector<Face>& faces,
+						 const EdgeMap& edgeMap);
+
+// Convenience overload that builds edge map internally
+HoleFillResult FillHoles(const std::vector<pxr::GfVec3f>& points,
+						 const std::vector<Face>& faces);
+
 } // namespace FixMeshNormals

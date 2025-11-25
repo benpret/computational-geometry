@@ -444,12 +444,28 @@ std::size_t ProcessStageFile(const std::filesystem::path& inputPath,
 		std::cout << "    Processing " << components.size() << " component(s)\n";
 		std::size_t processedComponents = 0;
 
+		// Pre-allocate combined arrays to avoid repeated reallocations
+		// Estimate: original size is a reasonable upper bound for fixed mesh
 		pxr::VtArray<pxr::GfVec3f> fixedPointsCombined;
 		pxr::VtArray<int> fixedCountsCombined;
 		pxr::VtArray<int> fixedIndicesCombined;
+		fixedPointsCombined.reserve(points.size());
+		fixedCountsCombined.reserve(counts.size());
+		fixedIndicesCombined.reserve(indices.size());
 
 		ProcessedMesh voxelCombined;
+		// Voxelization typically produces ~100x more vertices, but we can't predict exactly
+		// Reserve a reasonable initial capacity to reduce early reallocations
+		if (writeVoxelised) {
+			voxelCombined.points.reserve(points.size() * 10);
+			voxelCombined.faceVertexCounts.reserve(counts.size() * 10);
+			voxelCombined.faceVertexIndices.reserve(indices.size() * 10);
+		}
+
 		int totalOracleFlips = 0;
+
+		// // Only show per-component progress for small numbers of components
+		// const bool verboseProgress = components.size() <= 20;
 
 		for (const auto& compFaces : components) {
 			ComponentData comp = ExtractComponent(points, counts, indices, compFaces, faceOffsets);
@@ -457,9 +473,11 @@ std::size_t ProcessStageFile(const std::filesystem::path& inputPath,
 				continue;
 			}
 			const std::size_t compIndex = processedComponents + 1;
+
 			std::cout << "    Mesh " << prim.GetPath().GetString()
 					  << " component " << compIndex << "/" << components.size()
 					  << " (" << comp.counts.size() << " faces, " << comp.points.size() << " verts)\n";
+
 
 			pxr::GfVec3f pivot = ComputePivot(comp.points);
 			TranslatePoints(comp.points, -pivot);
@@ -469,20 +487,65 @@ std::size_t ProcessStageFile(const std::filesystem::path& inputPath,
 				continue;
 			}
 
+			// Check mesh topology after welding and fill holes if needed
+			std::vector<Face> weldedFaces = BuildFaces(welded.counts, welded.indices);
+			EdgeMap edgeMap = BuildEdgeMap(weldedFaces);
+			ManifoldDiagnostic diag = CheckManifold(weldedFaces);
+
+			// Fill holes if mesh is not watertight
+			// Skip hole filling for flat planes (1-2 faces) - they're intentionally open geometry
+			bool isFlatPlane = weldedFaces.size() <= 2;
+			if (!diag.isWatertight && !isFlatPlane) {
+				std::vector<pxr::GfVec3f> pointsVec(welded.points.begin(), welded.points.end());
+				HoleFillResult fillResult = FillHoles(pointsVec, weldedFaces, edgeMap);
+
+				if (fillResult.holesFilled > 0) {
+
+					std::cout << "    Filled " << fillResult.holesFilled << " hole(s) with "
+							  << fillResult.filledFaces.size() << " triangle(s)\n";
+
+
+					// Add fill faces to welded mesh
+					for (const auto& face : fillResult.filledFaces) {
+						welded.counts.push_back(static_cast<int>(face.size()));
+						for (int idx : face) {
+							welded.indices.push_back(idx);
+						}
+					}
+
+					// Re-check topology after hole filling
+					weldedFaces = BuildFaces(welded.counts, welded.indices);
+					edgeMap = BuildEdgeMap(weldedFaces);
+					diag = CheckManifold(weldedFaces);
+				}
+			}
+
+			if (!diag.isWatertight || !diag.isManifold) {
+				if (!isFlatPlane) {
+					PrintManifoldDiagnostic(diag, prim.GetPath().GetString() + " (after hole fill)");
+				}
+			}
+
 			auto [windingCounts, windingIndices] = FixWindingAndOrientation(welded.points, welded.counts, welded.indices);
 
-			MeshData sdfMesh = BuildMeshData(welded.points, windingCounts, windingIndices);
-			if (sdfMesh.IsEmpty()) {
-				continue;
-			}
+			// Skip SDF/voxelization for flat planes - they're intentionally 2D geometry
+			pxr::VtArray<int> oracleCounts = windingCounts;
+			pxr::VtArray<int> oracleIndices = windingIndices;
+			int oracleFlips = 0;
 
-			openvdb::FloatGrid::Ptr sdfGrid = CreateSDFFromMesh(sdfMesh);
-			if (!sdfGrid) {
-				continue;
+			if (!isFlatPlane) {
+				MeshData sdfMesh = BuildMeshData(welded.points, windingCounts, windingIndices);
+				if (!sdfMesh.IsEmpty()) {
+					openvdb::FloatGrid::Ptr sdfGrid = CreateSDFFromMesh(sdfMesh);
+					if (sdfGrid) {
+						auto [oCounts, oIndices, oFlips] = FixOrientationWithVDBOracle(
+							welded.points, windingCounts, windingIndices, sdfGrid);
+						oracleCounts = oCounts;
+						oracleIndices = oIndices;
+						oracleFlips = oFlips;
+					}
+				}
 			}
-
-			auto [oracleCounts, oracleIndices, oracleFlips] = FixOrientationWithVDBOracle(
-				welded.points, windingCounts, windingIndices, sdfGrid);
 			totalOracleFlips += oracleFlips;
 
 			// Build fixed geometry (restore pivot)
@@ -490,41 +553,56 @@ std::size_t ProcessStageFile(const std::filesystem::path& inputPath,
 			TranslatePoints(fixedPoints, pivot);
 
 			std::size_t baseFixed = fixedPointsCombined.size();
-			fixedPointsCombined.reserve(fixedPointsCombined.size() + fixedPoints.size());
-			for (const auto& p : fixedPoints) {
-				fixedPointsCombined.push_back(p);
-			}
-			fixedCountsCombined.reserve(fixedCountsCombined.size() + oracleCounts.size());
-			for (int c : oracleCounts) {
-				fixedCountsCombined.push_back(c);
-			}
-			for (int idx : oracleIndices) {
-				fixedIndicesCombined.push_back(static_cast<int>(baseFixed) + idx);
+			// Bulk append points
+			std::size_t oldPointsSize = fixedPointsCombined.size();
+			fixedPointsCombined.resize(oldPointsSize + fixedPoints.size());
+			std::copy(fixedPoints.begin(), fixedPoints.end(), fixedPointsCombined.begin() + oldPointsSize);
+			// Bulk append counts
+			std::size_t oldCountsSize = fixedCountsCombined.size();
+			fixedCountsCombined.resize(oldCountsSize + oracleCounts.size());
+			std::copy(oracleCounts.begin(), oracleCounts.end(), fixedCountsCombined.begin() + oldCountsSize);
+			// Indices need offset adjustment - bulk resize then fill
+			std::size_t oldIndicesSize = fixedIndicesCombined.size();
+			fixedIndicesCombined.resize(oldIndicesSize + oracleIndices.size());
+			for (std::size_t i = 0; i < oracleIndices.size(); ++i) {
+				fixedIndicesCombined[oldIndicesSize + i] = static_cast<int>(baseFixed) + oracleIndices[i];
 			}
 
-			// Voxelisation (always computed; optional write)
-			MeshData voxelMeshInput = BuildMeshData(welded.points, oracleCounts, oracleIndices);
-			ProcessedMesh voxelComp = VoxelizeMesh(voxelMeshInput);
-			if (!voxelComp.points.empty()) {
-				TranslatePoints(voxelComp.points, pivot);
-				// Recompute extent after translation
-				voxelComp.extent = ComputeExtentFromPoints(voxelComp.points);
+			// Voxelisation - skip for flat planes (intentionally 2D geometry) or if not writing voxelised output
+			if (!isFlatPlane && writeVoxelised) {
+				MeshData voxelMeshInput = BuildMeshData(welded.points, oracleCounts, oracleIndices);
+				ProcessedMesh voxelComp = VoxelizeMesh(voxelMeshInput);
+				if (!voxelComp.points.empty()) {
+					TranslatePoints(voxelComp.points, pivot);
+					// Recompute extent after translation
+					voxelComp.extent = ComputeExtentFromPoints(voxelComp.points);
 
-				std::size_t baseVoxel = voxelCombined.points.size();
-				voxelCombined.points.reserve(voxelCombined.points.size() + voxelComp.points.size());
-				for (const auto& p : voxelComp.points) {
-					voxelCombined.points.push_back(p);
-				}
-				voxelCombined.faceVertexCounts.reserve(voxelCombined.faceVertexCounts.size() + voxelComp.faceVertexCounts.size());
-				for (int c : voxelComp.faceVertexCounts) {
-					voxelCombined.faceVertexCounts.push_back(c);
-				}
-				for (int idx : voxelComp.faceVertexIndices) {
-					voxelCombined.faceVertexIndices.push_back(static_cast<int>(baseVoxel) + idx);
+					std::size_t baseVoxel = voxelCombined.points.size();
+					// Bulk append points
+					std::size_t oldVoxelPointsSize = voxelCombined.points.size();
+					voxelCombined.points.resize(oldVoxelPointsSize + voxelComp.points.size());
+					std::copy(voxelComp.points.begin(), voxelComp.points.end(),
+						voxelCombined.points.begin() + oldVoxelPointsSize);
+					// Bulk append counts
+					std::size_t oldVoxelCountsSize = voxelCombined.faceVertexCounts.size();
+					voxelCombined.faceVertexCounts.resize(oldVoxelCountsSize + voxelComp.faceVertexCounts.size());
+					std::copy(voxelComp.faceVertexCounts.begin(), voxelComp.faceVertexCounts.end(),
+						voxelCombined.faceVertexCounts.begin() + oldVoxelCountsSize);
+					// Indices need offset adjustment - bulk resize then fill
+					std::size_t oldVoxelIndicesSize = voxelCombined.faceVertexIndices.size();
+					voxelCombined.faceVertexIndices.resize(oldVoxelIndicesSize + voxelComp.faceVertexIndices.size());
+					for (std::size_t i = 0; i < voxelComp.faceVertexIndices.size(); ++i) {
+						voxelCombined.faceVertexIndices[oldVoxelIndicesSize + i] =
+							static_cast<int>(baseVoxel) + voxelComp.faceVertexIndices[i];
+					}
 				}
 			}
 			++processedComponents;
 		}
+
+		
+		std::cout << "                                                              \r";
+	
 
 		if (fixedPointsCombined.empty() || fixedCountsCombined.empty() || fixedIndicesCombined.empty()) {
 			std::cerr << "  Mesh " << mesh.GetPath().GetString() << " has no valid processed geometry; skipping.\n";
